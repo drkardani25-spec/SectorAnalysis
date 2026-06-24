@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Stock — Sector Analysis Dashboard</title>
+<link rel="stylesheet" href="/css/style.css" />
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="/"><h1>Sector Analysis Dashboard</h1></a>
+  <div class="meta" id="stock-title"></div>
+</header>
+
+<main>
+  <div class="breadcrumb" id="breadcrumb"></div>
+
+  <div class="badge-note">
+    Price, VWAP and PE-vs-sector come from NSE's live quote feed. "Quality Snapshot"
+    below is built only from signals NSE's free API actually exposes — it is
+    <strong>not</strong> a full Piotroski F-score or a true Book-Value-vs-industry
+    comparison (those need multi-year balance sheet data NSE doesn't give away
+    for free). Treat it as a rough momentum + valuation read, not a substitute
+    for reading the actual results. For deeper fundamentals, cross-check on
+    Screener.in or the company's investor relations page.
+  </div>
+
+  <div id="error-area"></div>
+
+  <div class="stat-grid" id="stat-grid">
+    <div class="loading">Loading live quote…</div>
+  </div>
+
+  <div class="section-title">Quality snapshot (approximate)</div>
+  <div class="stat-grid" id="quality-grid"></div>
+
+  <div class="section-title">Latest news</div>
+  <div id="news-list"><div class="loading">Loading news…</div></div>
+
+  <div class="section-title">Recent results</div>
+  <div id="results-area" class="badge-note">
+    NSE's free API doesn't expose parsed quarterly/annual P&amp;L figures.
+    Use the links below to check the company's latest filed results directly.
+  </div>
+  <div id="results-links"></div>
+</main>
+
+<script src="/js/api.js"></script>
+<script src="/js/metrics.js"></script>
+<script>
+const params = new URLSearchParams(location.search);
+const symbol = params.get('symbol') || '';
+document.getElementById('stock-title').textContent = symbol;
+
+let stocksMap = {};
+
+async function init() {
+  stocksMap = await fetch('/data/stocks.json').then(r => r.json());
+  const info = stocksMap[symbol] || { name: symbol, sector: '' };
+  document.getElementById('breadcrumb').innerHTML =
+    `<a href="/">All sectors</a> &rsaquo; <a href="/sector.html?sector=${encodeURIComponent(info.sector)}">${info.sector}</a> &rsaquo; ${symbol}`;
+  document.getElementById('stock-title').textContent = `${info.name} (${symbol})`;
+
+  renderResultsLinks(info);
+  loadQuote();
+  loadNews(info);
+}
+
+function renderResultsLinks(info) {
+  const screenerUrl = `https://www.screener.in/company/${encodeURIComponent(symbol)}/`;
+  const nseUrl = `https://www.nseindia.com/get-quotes/equity?symbol=${encodeURIComponent(symbol)}`;
+  document.getElementById('results-links').innerHTML = `
+    <a class="btn" href="${nseUrl}" target="_blank" rel="noopener">NSE quote &amp; filings</a>
+    <a class="btn" href="${screenerUrl}" target="_blank" rel="noopener" style="margin-left:8px;">Screener.in financials</a>
+  `;
+}
+
+async function loadQuote() {
+  const statGrid = document.getElementById('stat-grid');
+  const qualityGrid = document.getElementById('quality-grid');
+  const errorArea = document.getElementById('error-area');
+
+  try {
+    const { data, stale, error } = await Api.quote(symbol);
+    if (stale) {
+      errorArea.innerHTML = `<div class="error-box">Live NSE data unavailable right now (${error}). Showing last cached values.<span class="stale-tag">STALE</span></div>`;
+    }
+
+    const priceInfo = data.priceInfo || {};
+    const pe = peVsIndustry(data);
+    const vwap = priceVsVwap(data);
+    const wk52 = priceInfo.weekHighLow || {};
+
+    statGrid.innerHTML = `
+      ${statBox('Last price', fmtNum(priceInfo.lastPrice), pctSub(priceInfo.pChange))}
+      ${statBox('VWAP', fmtNum(priceInfo.vwap), pctSub(vwap.deltaPct, 'vs VWAP'))}
+      ${statBox('52-wk high', fmtNum(wk52.max))}
+      ${statBox('52-wk low', fmtNum(wk52.min))}
+      ${statBox('Symbol PE', fmtNum(pe.symbolPe))}
+      ${statBox('Sector PE', fmtNum(pe.sectorPe), pctSub(pe.deltaPct, 'vs sector'))}
+    `;
+
+    qualityGrid.innerHTML = `
+      ${statBox('Valuation read', pe.deltaPct == null ? 'N/A' : (pe.deltaPct < 0 ? 'Trading below sector PE' : 'Trading above sector PE'))}
+      ${statBox('Price vs VWAP', vwap.deltaPct == null ? 'N/A' : (vwap.deltaPct > 0 ? 'Above VWAP (strength)' : 'Below VWAP (weakness)'))}
+      ${statBox('Note', 'Add Screener.in CSV import for full Piotroski / BV-vs-industry — not available from NSE free feed')}
+    `;
+  } catch (err) {
+    statGrid.innerHTML = `<div class="error-box">Could not load quote: ${err.message}</div>`;
+  }
+}
+
+async function loadNews(info) {
+  const newsList = document.getElementById('news-list');
+  try {
+    const { data, stale } = await Api.news(info.name || symbol);
+    const items = data.items || data || [];
+    if (!items.length) {
+      newsList.innerHTML = '<div class="loading">No recent news found.</div>';
+      return;
+    }
+    newsList.innerHTML = items.slice(0, 10).map(item => `
+      <div class="news-item">
+        <a href="${item.link}" target="_blank" rel="noopener">${item.title}</a>
+        <div class="src">${item.source || ''} ${item.pubDate ? '· ' + new Date(item.pubDate).toLocaleDateString() : ''}</div>
+      </div>
+    `).join('') + (stale ? '<span class="stale-tag">STALE</span>' : '');
+  } catch (err) {
+    newsList.innerHTML = `<div class="error-box">Could not load news: ${err.message}</div>`;
+  }
+}
+
+function statBox(label, value, sub) {
+  return `<div class="stat">
+    <div class="label">${label}</div>
+    <div class="value">${value ?? 'N/A'}</div>
+    ${sub ? `<div class="sub">${sub}</div>` : ''}
+  </div>`;
+}
+
+function fmtNum(v) { return v == null ? 'N/A' : Number(v).toFixed(2); }
+
+function pctSub(val, suffix = '') {
+  if (val == null) return '';
+  const sign = val > 0 ? '+' : '';
+  return `${sign}${val.toFixed(1)}% ${suffix}`;
+}
+
+init();
+</script>
+</body>
+</html>

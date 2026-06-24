@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Sector — Sector Analysis Dashboard</title>
+<link rel="stylesheet" href="/css/style.css" />
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="/"><h1>Sector Analysis Dashboard</h1></a>
+  <div class="meta" id="sector-title"></div>
+</header>
+
+<main>
+  <div class="breadcrumb"><a href="/">&larr; All sectors</a></div>
+
+  <div class="badge-note">
+    PE vs Sector PE comes straight from NSE's own classification, so it's reliable
+    when NSE responds. Click "Load valuation &amp; momentum" per stock or use
+    "Load all" — each stock costs one NSE call, so loading all is slower and more
+    likely to hit rate limits.
+  </div>
+
+  <div class="toolbar">
+    <label>Filter
+      <select id="filter-select">
+        <option value="all">All stocks</option>
+        <option value="cheap">PE below sector PE</option>
+        <option value="expensive">PE above sector PE</option>
+        <option value="momentum-up">4-wk change positive</option>
+      </select>
+    </label>
+    <label>Sort by
+      <select id="sort-select">
+        <option value="name">Name</option>
+        <option value="pe-delta">PE vs sector (cheapest first)</option>
+        <option value="momentum">4-week momentum</option>
+      </select>
+    </label>
+    <button class="btn primary" id="load-all-btn">Load all (live)</button>
+  </div>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Symbol</th>
+        <th>Company</th>
+        <th>Price</th>
+        <th>PE</th>
+        <th>Sector PE</th>
+        <th>PE vs Sector</th>
+        <th>Price vs VWAP</th>
+        <th>4-wk change</th>
+        <th>Vol vs 20d avg</th>
+      </tr>
+    </thead>
+    <tbody id="stock-rows"></tbody>
+  </table>
+</main>
+
+<script src="/js/api.js"></script>
+<script src="/js/metrics.js"></script>
+<script>
+const params = new URLSearchParams(location.search);
+const sector = params.get('sector') || '';
+document.getElementById('sector-title').textContent = sector;
+
+let stocksMap = {};
+let symbols = [];
+const rowData = {}; // symbol -> {quote metrics, hist metrics, error}
+
+async function init() {
+  const [sectorsRes, stocksRes] = await Promise.all([
+    fetch('/data/sectors.json').then(r => r.json()),
+    fetch('/data/stocks.json').then(r => r.json()),
+  ]);
+  stocksMap = stocksRes;
+  symbols = sectorsRes[sector] || [];
+  render();
+}
+
+function render() {
+  const tbody = document.getElementById('stock-rows');
+  const filter = document.getElementById('filter-select').value;
+  const sortBy = document.getElementById('sort-select').value;
+
+  let list = symbols.slice();
+
+  if (filter === 'cheap') list = list.filter(s => peDelta(s) != null && peDelta(s) < 0);
+  if (filter === 'expensive') list = list.filter(s => peDelta(s) != null && peDelta(s) > 0);
+  if (filter === 'momentum-up') list = list.filter(s => (rowData[s]?.pctChange4w ?? null) > 0);
+
+  if (sortBy === 'name') list.sort((a, b) => (stocksMap[a]?.name || a).localeCompare(stocksMap[b]?.name || b));
+  if (sortBy === 'pe-delta') list.sort((a, b) => (peDelta(a) ?? 999) - (peDelta(b) ?? 999));
+  if (sortBy === 'momentum') list.sort((a, b) => (rowData[b]?.pctChange4w ?? -999) - (rowData[a]?.pctChange4w ?? -999));
+
+  tbody.innerHTML = list.map(rowHtml).join('');
+
+  list.forEach(s => {
+    const btn = document.getElementById(`load-row-${s}`);
+    if (btn) btn.addEventListener('click', (e) => { e.stopPropagation(); loadRow(s); });
+    const tr = document.getElementById(`tr-${s}`);
+    if (tr) tr.addEventListener('click', () => { location.href = `/stock.html?symbol=${s}`; });
+  });
+}
+
+function peDelta(symbol) {
+  return rowData[symbol]?.deltaPct ?? null;
+}
+
+function rowHtml(symbol) {
+  const info = stocksMap[symbol] || { name: symbol };
+  const d = rowData[symbol];
+
+  if (!d) {
+    return `<tr id="tr-${symbol}" class="row">
+      <td>${symbol}</td><td>${info.name}</td>
+      <td colspan="6"><button class="btn" id="load-row-${symbol}">Load</button></td>
+    </tr>`;
+  }
+  if (d.error) {
+    return `<tr id="tr-${symbol}" class="row">
+      <td>${symbol}</td><td>${info.name}</td>
+      <td colspan="6" style="color:var(--text-dim)">data unavailable</td>
+    </tr>`;
+  }
+  return `<tr id="tr-${symbol}" class="row">
+    <td>${symbol}</td>
+    <td>${info.name}</td>
+    <td>${fmtNum(d.price)}</td>
+    <td>${fmtNum(d.symbolPe)}</td>
+    <td>${fmtNum(d.sectorPe)}</td>
+    <td>${pctPill(d.deltaPct)}</td>
+    <td>${pctPill(d.vwapDeltaPct)}</td>
+    <td>${pctPill(d.pctChange4w)}</td>
+    <td>${d.volRatio != null ? d.volRatio.toFixed(2) + 'x' : 'N/A'}</td>
+  </tr>`;
+}
+
+function fmtNum(v) { return v == null ? 'N/A' : Number(v).toFixed(2); }
+
+function pctPill(val) {
+  if (val == null) return '<span class="pill flat">N/A</span>';
+  const cls = val > 0.3 ? 'up' : val < -0.3 ? 'down' : 'flat';
+  const sign = val > 0 ? '+' : '';
+  return `<span class="pill ${cls}">${sign}${val.toFixed(1)}%</span>`;
+}
+
+async function loadRow(symbol) {
+  const cell = document.getElementById(`load-row-${symbol}`);
+  if (cell) cell.textContent = 'Loading…';
+
+  try {
+    const [{ data: quoteData }, { from, to }] = [await Api.quote(symbol), dateRangeForDays(35)];
+    const pe = peVsIndustry(quoteData);
+    const vwap = priceVsVwap(quoteData);
+
+    let histMetrics = { pctChange4w: null, volRatio: null };
+    try {
+      const { data: histData } = await Api.historical(symbol, from, to);
+      histMetrics = computeFromHistorical(histData);
+    } catch { /* leave nulls, quote data still useful */ }
+
+    rowData[symbol] = {
+      price: vwap.price,
+      symbolPe: pe.symbolPe,
+      sectorPe: pe.sectorPe,
+      deltaPct: pe.deltaPct,
+      vwapDeltaPct: vwap.deltaPct,
+      pctChange4w: histMetrics.pctChange4w,
+      volRatio: histMetrics.volRatio,
+    };
+  } catch (err) {
+    rowData[symbol] = { error: err.message };
+  }
+  render();
+}
+
+document.getElementById('filter-select').addEventListener('change', render);
+document.getElementById('sort-select').addEventListener('change', render);
+document.getElementById('load-all-btn').addEventListener('click', async () => {
+  for (const s of symbols) {
+    if (!rowData[s]) await loadRow(s);
+  }
+});
+
+init();
+</script>
+</body>
+</html>

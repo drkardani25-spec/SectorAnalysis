@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Sector Analysis Dashboard</title>
+<link rel="stylesheet" href="/css/style.css" />
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="/"><h1>Sector Analysis Dashboard</h1></a>
+  <div class="meta" id="updated-meta">Nifty 500 &middot; 20 NSE sectors</div>
+</header>
+
+<main>
+  <div class="badge-note" id="data-note">
+    Metrics load on demand per sector (click "Load metrics") to stay within NSE's
+    rate limits. Live data may occasionally be unavailable — NSE blocks some
+    requests from cloud-hosted servers; cached/last-known values are shown when that happens.
+  </div>
+
+  <div class="toolbar">
+    <label>Sort sectors by
+      <select id="sort-select">
+        <option value="name">Name (A-Z)</option>
+        <option value="momentum">4-week momentum (loaded sectors first)</option>
+        <option value="count">Number of stocks</option>
+      </select>
+    </label>
+    <button class="btn primary" id="load-all-btn">Load metrics for all sectors</button>
+  </div>
+
+  <div class="sector-grid" id="sector-grid"></div>
+</main>
+
+<script src="/js/api.js"></script>
+<script src="/js/metrics.js"></script>
+<script>
+let sectorsMap = {};   // sector -> [symbols]
+let stocksMap = {};    // symbol -> {name, sector, isin, yahooSymbol}
+const loadedMetrics = {}; // sector -> {avgChange, avgVolRatio, sampleSize}
+
+async function init() {
+  const [sectorsRes, stocksRes] = await Promise.all([
+    fetch('/data/sectors.json').then(r => r.json()),
+    fetch('/data/stocks.json').then(r => r.json()),
+  ]);
+  sectorsMap = sectorsRes;
+  stocksMap = stocksRes;
+  renderGrid();
+}
+
+function renderGrid() {
+  const grid = document.getElementById('sector-grid');
+  const sortBy = document.getElementById('sort-select').value;
+  let sectors = Object.keys(sectorsMap);
+
+  if (sortBy === 'name') sectors.sort();
+  else if (sortBy === 'count') sectors.sort((a, b) => sectorsMap[b].length - sectorsMap[a].length);
+  else if (sortBy === 'momentum') {
+    sectors.sort((a, b) => {
+      const ma = loadedMetrics[a]?.avgChange;
+      const mb = loadedMetrics[b]?.avgChange;
+      if (ma == null && mb == null) return 0;
+      if (ma == null) return 1;
+      if (mb == null) return -1;
+      return mb - ma;
+    });
+  }
+
+  grid.innerHTML = sectors.map(sectorCardHtml).join('');
+
+  sectors.forEach(s => {
+    const btn = document.getElementById(`load-${cssKey(s)}`);
+    if (btn) btn.addEventListener('click', () => loadSectorMetrics(s));
+  });
+}
+
+function cssKey(s) { return s.replace(/[^a-z0-9]/gi, '_'); }
+
+function sectorCardHtml(sector) {
+  const symbols = sectorsMap[sector];
+  const m = loadedMetrics[sector];
+  const slug = encodeURIComponent(sector);
+
+  let metricsHtml;
+  if (!m) {
+    metricsHtml = `<button class="btn" id="load-${cssKey(sector)}">Load metrics</button>`;
+  } else if (m.error) {
+    metricsHtml = `<div class="error-box">${m.error}</div>`;
+  } else {
+    const pill = pctPill(m.avgChange);
+    metricsHtml = `
+      <div class="metric-row"><span class="label">Avg 4-wk change (sample)</span><span>${pill}</span></div>
+      <div class="metric-row"><span class="label">Avg volume vs 20d avg</span><span>${fmtRatio(m.avgVolRatio)}</span></div>
+      <div class="metric-row"><span class="label">Sampled / total</span><span>${m.sampleSize}/${symbols.length}</span></div>
+    `;
+  }
+
+  return `
+    <div class="card">
+      <div class="sector-name"><a href="/sector.html?sector=${slug}">${sector}</a></div>
+      <div class="count">${symbols.length} stocks</div>
+      ${metricsHtml}
+    </div>
+  `;
+}
+
+function pctPill(val) {
+  if (val == null) return '<span class="pill flat">N/A</span>';
+  const cls = val > 0.3 ? 'up' : val < -0.3 ? 'down' : 'flat';
+  const sign = val > 0 ? '+' : '';
+  return `<span class="pill ${cls}">${sign}${val.toFixed(1)}%</span>`;
+}
+
+function fmtRatio(val) {
+  if (val == null) return 'N/A';
+  return `${val.toFixed(2)}x`;
+}
+
+// Samples up to N stocks per sector (largest-listed-first, since NSE's own
+// Nifty500 list is roughly cap-ordered) to keep request volume sane and
+// reduce the chance of NSE's anti-bot rate limiting kicking in.
+const SAMPLE_SIZE = 8;
+
+async function loadSectorMetrics(sector) {
+  const grid = document.getElementById('sector-grid');
+  loadedMetrics[sector] = null; // mark in-flight by clearing then re-render with spinner text
+  renderLoadingCard(sector);
+
+  const symbols = sectorsMap[sector].slice(0, SAMPLE_SIZE);
+  const { from, to } = dateRangeForDays(35);
+
+  let changes = [], volRatios = [], errors = 0;
+  for (const symbol of symbols) {
+    try {
+      const { data } = await Api.historical(symbol, from, to);
+      const m = computeFromHistorical(data);
+      if (m.pctChange4w != null) changes.push(m.pctChange4w);
+      if (m.volRatio != null) volRatios.push(m.volRatio);
+    } catch {
+      errors++;
+    }
+  }
+
+  if (changes.length === 0 && volRatios.length === 0) {
+    loadedMetrics[sector] = { error: 'NSE data unavailable right now for this sector — try again shortly.' };
+  } else {
+    loadedMetrics[sector] = {
+      avgChange: changes.length ? changes.reduce((a, b) => a + b, 0) / changes.length : null,
+      avgVolRatio: volRatios.length ? volRatios.reduce((a, b) => a + b, 0) / volRatios.length : null,
+      sampleSize: symbols.length - errors,
+    };
+  }
+  renderGrid();
+}
+
+function renderLoadingCard(sector) {
+  const el = document.querySelector(`[id="load-${cssKey(sector)}"]`);
+  if (el) el.outerHTML = '<div class="loading">Loading live data…</div>';
+}
+
+document.getElementById('sort-select').addEventListener('change', renderGrid);
+document.getElementById('load-all-btn').addEventListener('click', async () => {
+  for (const sector of Object.keys(sectorsMap)) {
+    if (!loadedMetrics[sector]) await loadSectorMetrics(sector);
+  }
+});
+
+init();
+</script>
+</body>
+</html>
