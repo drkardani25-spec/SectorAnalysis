@@ -29,6 +29,7 @@
         <option value="cheap">PE below sector PE</option>
         <option value="expensive">PE above sector PE</option>
         <option value="momentum-up">4-wk change positive</option>
+        <option value="high-conviction">High conviction (score ≥ 65)</option>
       </select>
     </label>
     <label>Sort by
@@ -36,9 +37,21 @@
         <option value="name">Name</option>
         <option value="pe-delta">PE vs sector (cheapest first)</option>
         <option value="momentum">4-week momentum</option>
+        <option value="conviction">Conviction score</option>
       </select>
     </label>
     <button class="btn primary" id="load-all-btn">Load all (live)</button>
+  </div>
+
+  <div class="chart-row">
+    <div class="chart-card chart-card-wide">
+      <div class="chart-title">4-week momentum by stock <span class="chart-sub">(loaded stocks)</span></div>
+      <div class="chart-wrap chart-wrap-bar"><canvas id="momentum-chart"></canvas></div>
+    </div>
+    <div class="chart-card chart-card-wide">
+      <div class="chart-title">Valuation vs momentum <span class="chart-sub">(bottom-right = cheap &amp; trending up)</span></div>
+      <div class="chart-wrap chart-wrap-scatter"><canvas id="scatter-chart"></canvas></div>
+    </div>
   </div>
 
   <table>
@@ -53,12 +66,14 @@
         <th>Price vs VWAP</th>
         <th>4-wk change</th>
         <th>Vol vs 20d avg</th>
+        <th>Conviction</th>
       </tr>
     </thead>
     <tbody id="stock-rows"></tbody>
   </table>
 </main>
 
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.4/chart.umd.min.js"></script>
 <script src="/js/api.js"></script>
 <script src="/js/metrics.js"></script>
 <script>
@@ -69,6 +84,19 @@ document.getElementById('sector-title').textContent = sector;
 let stocksMap = {};
 let symbols = [];
 const rowData = {}; // symbol -> {quote metrics, hist metrics, error}
+let momentumChart = null;
+let scatterChart = null;
+
+// Sector-level momentum (philosophy point #1: "pick a trending sector"),
+// approximated as the average 4-week change across whatever stocks in this
+// sector have been loaded so far. Recomputes live as more rows load.
+function sectorMomentumAvg() {
+  const changes = Object.values(rowData)
+    .map(d => d?.pctChange4w)
+    .filter(v => v != null);
+  if (!changes.length) return null;
+  return changes.reduce((a, b) => a + b, 0) / changes.length;
+}
 
 async function init() {
   const [sectorsRes, stocksRes] = await Promise.all([
@@ -78,6 +106,61 @@ async function init() {
   stocksMap = stocksRes;
   symbols = sectorsRes[sector] || [];
   render();
+  renderCharts();
+}
+
+function renderCharts() {
+  const loaded = symbols.filter(s => rowData[s] && !rowData[s].error);
+  const labels = loaded.map(s => stocksMap[s]?.name || s);
+
+  const momentumCtx = document.getElementById('momentum-chart');
+  const momentumData = loaded.map(s => rowData[s].pctChange4w ?? 0);
+  const momentumColors = momentumData.map(v => v >= 0 ? 'rgba(46,204,113,0.75)' : 'rgba(231,76,60,0.75)');
+  if (momentumChart) momentumChart.destroy();
+  momentumChart = new Chart(momentumCtx, {
+    type: 'bar',
+    data: { labels, datasets: [{ data: momentumData, backgroundColor: momentumColors, borderRadius: 4 }] },
+    options: {
+      plugins: { legend: { display: false }, tooltip: { callbacks: { label: (c) => `${c.raw.toFixed(1)}%` } } },
+      scales: {
+        x: { ticks: { color: '#8b93a7', autoSkip: true, maxRotation: 60, minRotation: 30 }, grid: { display: false } },
+        y: { ticks: { color: '#8b93a7' }, grid: { color: '#262c3d' } },
+      },
+    },
+  });
+
+  const scatterCtx = document.getElementById('scatter-chart');
+  const points = loaded.map(s => ({
+    x: rowData[s].deltaPct ?? 0,
+    y: rowData[s].pctChange4w ?? 0,
+    label: stocksMap[s]?.name || s,
+  }));
+  if (scatterChart) scatterChart.destroy();
+  scatterChart = new Chart(scatterCtx, {
+    type: 'scatter',
+    data: { datasets: [{ data: points, backgroundColor: 'rgba(79,140,255,0.8)', pointRadius: 5 }] },
+    options: {
+      plugins: {
+        legend: { display: false },
+        tooltip: { callbacks: { label: (c) => `${c.raw.label}: PE ${c.raw.x.toFixed(1)}% vs sector, ${c.raw.y.toFixed(1)}% 4-wk` } },
+      },
+      scales: {
+        x: { title: { display: true, text: 'PE vs sector PE (%)', color: '#8b93a7' }, ticks: { color: '#8b93a7' }, grid: { color: '#262c3d' } },
+        y: { title: { display: true, text: '4-week change (%)', color: '#8b93a7' }, ticks: { color: '#8b93a7' }, grid: { color: '#262c3d' } },
+      },
+    },
+  });
+
+  const noData = loaded.length === 0;
+  [momentumCtx, scatterCtx].forEach(ctx => {
+    ctx.parentElement.querySelector('.chart-empty')?.remove();
+    if (noData) {
+      const empty = document.createElement('div');
+      empty.className = 'chart-empty';
+      empty.textContent = 'Load at least one stock to populate this chart.';
+      ctx.parentElement.appendChild(empty);
+    }
+  });
 }
 
 function render() {
@@ -90,10 +173,12 @@ function render() {
   if (filter === 'cheap') list = list.filter(s => peDelta(s) != null && peDelta(s) < 0);
   if (filter === 'expensive') list = list.filter(s => peDelta(s) != null && peDelta(s) > 0);
   if (filter === 'momentum-up') list = list.filter(s => (rowData[s]?.pctChange4w ?? null) > 0);
+  if (filter === 'high-conviction') list = list.filter(s => (convictionFor(s)?.score ?? -1) >= 65);
 
   if (sortBy === 'name') list.sort((a, b) => (stocksMap[a]?.name || a).localeCompare(stocksMap[b]?.name || b));
   if (sortBy === 'pe-delta') list.sort((a, b) => (peDelta(a) ?? 999) - (peDelta(b) ?? 999));
   if (sortBy === 'momentum') list.sort((a, b) => (rowData[b]?.pctChange4w ?? -999) - (rowData[a]?.pctChange4w ?? -999));
+  if (sortBy === 'conviction') list.sort((a, b) => (convictionFor(b)?.score ?? -1) - (convictionFor(a)?.score ?? -1));
 
   tbody.innerHTML = list.map(rowHtml).join('');
 
@@ -109,6 +194,18 @@ function peDelta(symbol) {
   return rowData[symbol]?.deltaPct ?? null;
 }
 
+function convictionFor(symbol) {
+  const d = rowData[symbol];
+  if (!d || d.error) return null;
+  return convictionScore({
+    peDeltaPct: d.deltaPct,
+    pctChange4w: d.pctChange4w,
+    vwapDeltaPct: d.vwapDeltaPct,
+    volRatio: d.volRatio,
+    sectorMomentum: sectorMomentumAvg(),
+  });
+}
+
 function rowHtml(symbol) {
   const info = stocksMap[symbol] || { name: symbol };
   const d = rowData[symbol];
@@ -116,15 +213,16 @@ function rowHtml(symbol) {
   if (!d) {
     return `<tr id="tr-${symbol}" class="row">
       <td>${symbol}</td><td>${info.name}</td>
-      <td colspan="6"><button class="btn" id="load-row-${symbol}">Load</button></td>
+      <td colspan="7"><button class="btn" id="load-row-${symbol}">Load</button></td>
     </tr>`;
   }
   if (d.error) {
     return `<tr id="tr-${symbol}" class="row">
       <td>${symbol}</td><td>${info.name}</td>
-      <td colspan="6" style="color:var(--text-dim)">data unavailable</td>
+      <td colspan="7" style="color:var(--text-dim)">data unavailable</td>
     </tr>`;
   }
+  const conv = convictionFor(symbol);
   return `<tr id="tr-${symbol}" class="row">
     <td>${symbol}</td>
     <td>${info.name}</td>
@@ -135,7 +233,14 @@ function rowHtml(symbol) {
     <td>${pctPill(d.vwapDeltaPct)}</td>
     <td>${pctPill(d.pctChange4w)}</td>
     <td>${d.volRatio != null ? d.volRatio.toFixed(2) + 'x' : 'N/A'}</td>
+    <td>${convictionPill(conv)}</td>
   </tr>`;
+}
+
+function convictionPill(conv) {
+  if (!conv) return '<span class="pill flat">N/A</span>';
+  const color = convictionColor(conv.score);
+  return `<span class="pill" style="background:${color}22;color:${color}">${conv.score}</span>`;
 }
 
 function fmtNum(v) { return v == null ? 'N/A' : Number(v).toFixed(2); }
@@ -175,6 +280,7 @@ async function loadRow(symbol) {
     rowData[symbol] = { error: err.message };
   }
   render();
+  renderCharts();
 }
 
 document.getElementById('filter-select').addEventListener('change', render);

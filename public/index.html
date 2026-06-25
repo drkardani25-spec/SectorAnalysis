@@ -30,15 +30,36 @@
     <button class="btn primary" id="load-all-btn">Load metrics for all sectors</button>
   </div>
 
+  <div class="chart-row">
+    <div class="chart-card">
+      <div class="chart-title">Sector composition (Nifty 500)</div>
+      <div class="chart-wrap chart-wrap-pie"><canvas id="composition-chart"></canvas></div>
+    </div>
+    <div class="chart-card chart-card-wide">
+      <div class="chart-title">Sector momentum ranking <span class="chart-sub">(loaded sectors, avg 4-wk change)</span></div>
+      <div class="chart-wrap chart-wrap-bar"><canvas id="momentum-chart"></canvas></div>
+    </div>
+  </div>
+
   <div class="sector-grid" id="sector-grid"></div>
 </main>
 
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.4/chart.umd.min.js"></script>
 <script src="/js/api.js"></script>
 <script src="/js/metrics.js"></script>
 <script>
 let sectorsMap = {};   // sector -> [symbols]
 let stocksMap = {};    // symbol -> {name, sector, isin, yahooSymbol}
 const loadedMetrics = {}; // sector -> {avgChange, avgVolRatio, sampleSize}
+let compositionChart = null;
+let momentumChart = null;
+
+const CHART_PALETTE = [
+  '#4f8cff', '#2ecc71', '#f5a623', '#e74c3c', '#9b59b6', '#1abc9c',
+  '#e67e22', '#3498db', '#e84393', '#16a085', '#f39c12', '#8e44ad',
+  '#2980b9', '#c0392b', '#27ae60', '#d35400', '#2c3e50', '#7f8c8d',
+  '#fd79a8', '#00b894',
+];
 
 async function init() {
   const [sectorsRes, stocksRes] = await Promise.all([
@@ -48,6 +69,68 @@ async function init() {
   sectorsMap = sectorsRes;
   stocksMap = stocksRes;
   renderGrid();
+  renderCompositionChart();
+  renderMomentumChart();
+}
+
+function renderCompositionChart() {
+  const ctx = document.getElementById('composition-chart');
+  const sectors = Object.keys(sectorsMap).sort((a, b) => sectorsMap[b].length - sectorsMap[a].length);
+  compositionChart = new Chart(ctx, {
+    type: 'doughnut',
+    data: {
+      labels: sectors,
+      datasets: [{
+        data: sectors.map(s => sectorsMap[s].length),
+        backgroundColor: sectors.map((_, i) => CHART_PALETTE[i % CHART_PALETTE.length]),
+        borderColor: '#0b0e14',
+        borderWidth: 2,
+      }],
+    },
+    options: {
+      plugins: {
+        legend: { display: false },
+        tooltip: { callbacks: { label: (c) => `${c.label}: ${c.raw} stocks` } },
+      },
+      cutout: '60%',
+    },
+  });
+}
+
+function renderMomentumChart() {
+  const ctx = document.getElementById('momentum-chart');
+  const sectors = Object.keys(loadedMetrics).filter(s => loadedMetrics[s] && !loadedMetrics[s].error);
+  const sorted = sectors.slice().sort((a, b) => (loadedMetrics[b].avgChange ?? -999) - (loadedMetrics[a].avgChange ?? -999));
+
+  const data = sorted.map(s => loadedMetrics[s].avgChange ?? 0);
+  const colors = data.map(v => v >= 0 ? 'rgba(46,204,113,0.75)' : 'rgba(231,76,60,0.75)');
+
+  if (momentumChart) momentumChart.destroy();
+  momentumChart = new Chart(ctx, {
+    type: 'bar',
+    data: {
+      labels: sorted,
+      datasets: [{ data, backgroundColor: colors, borderRadius: 4 }],
+    },
+    options: {
+      indexAxis: 'y',
+      plugins: { legend: { display: false }, tooltip: { callbacks: { label: (c) => `${c.raw.toFixed(1)}%` } } },
+      scales: {
+        x: { ticks: { color: '#8b93a7' }, grid: { color: '#262c3d' } },
+        y: { ticks: { color: '#8b93a7' }, grid: { display: false } },
+      },
+    },
+  });
+
+  if (sorted.length === 0) {
+    ctx.parentElement.querySelector('.chart-empty')?.remove();
+    const empty = document.createElement('div');
+    empty.className = 'chart-empty';
+    empty.textContent = 'Load metrics for at least one sector to populate this chart.';
+    ctx.parentElement.appendChild(empty);
+  } else {
+    ctx.parentElement.querySelector('.chart-empty')?.remove();
+  }
 }
 
 function renderGrid() {
@@ -153,6 +236,7 @@ async function loadSectorMetrics(sector) {
     };
   }
   renderGrid();
+  renderMomentumChart();
 }
 
 function renderLoadingCard(sector) {

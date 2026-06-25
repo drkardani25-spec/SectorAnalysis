@@ -16,13 +16,15 @@
   <div class="breadcrumb" id="breadcrumb"></div>
 
   <div class="badge-note">
-    Price, VWAP and PE-vs-sector come from NSE's live quote feed. "Quality Snapshot"
-    below is built only from signals NSE's free API actually exposes — it is
-    <strong>not</strong> a full Piotroski F-score or a true Book-Value-vs-industry
-    comparison (those need multi-year balance sheet data NSE doesn't give away
-    for free). Treat it as a rough momentum + valuation read, not a substitute
-    for reading the actual results. For deeper fundamentals, cross-check on
-    Screener.in or the company's investor relations page.
+    Price, VWAP and PE-vs-sector come from NSE's live quote feed. The
+    <strong>Conviction Score</strong> below is a composite built only from
+    signals NSE's free API actually exposes (valuation vs sector, momentum,
+    price/volume strength, sector trend) — it is <strong>not</strong> a full
+    Piotroski F-score or a true Book-Value-vs-industry comparison, and says
+    nothing about management quality or governance. Treat it as a rough,
+    directional read, not a substitute for reading the actual results. For
+    deeper fundamentals, cross-check on Screener.in or the company's investor
+    relations page.
   </div>
 
   <div id="error-area"></div>
@@ -31,8 +33,17 @@
     <div class="loading">Loading live quote…</div>
   </div>
 
-  <div class="section-title">Quality snapshot (approximate)</div>
-  <div class="stat-grid" id="quality-grid"></div>
+  <div class="section-title">52-week range</div>
+  <div id="range-bar-area"></div>
+
+  <div class="section-title">Conviction score</div>
+  <div class="conviction-row">
+    <div class="chart-wrap chart-wrap-gauge">
+      <canvas id="conviction-gauge"></canvas>
+      <div class="gauge-center" id="gauge-center"></div>
+    </div>
+    <div class="conviction-breakdown" id="conviction-breakdown"></div>
+  </div>
 
   <div class="section-title">Latest news</div>
   <div id="news-list"><div class="loading">Loading news…</div></div>
@@ -45,6 +56,7 @@
   <div id="results-links"></div>
 </main>
 
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.4/chart.umd.min.js"></script>
 <script src="/js/api.js"></script>
 <script src="/js/metrics.js"></script>
 <script>
@@ -53,6 +65,7 @@ const symbol = params.get('symbol') || '';
 document.getElementById('stock-title').textContent = symbol;
 
 let stocksMap = {};
+let gaugeChart = null;
 
 async function init() {
   stocksMap = await fetch('/data/stocks.json').then(r => r.json());
@@ -77,7 +90,6 @@ function renderResultsLinks(info) {
 
 async function loadQuote() {
   const statGrid = document.getElementById('stat-grid');
-  const qualityGrid = document.getElementById('quality-grid');
   const errorArea = document.getElementById('error-area');
 
   try {
@@ -100,14 +112,102 @@ async function loadQuote() {
       ${statBox('Sector PE', fmtNum(pe.sectorPe), pctSub(pe.deltaPct, 'vs sector'))}
     `;
 
-    qualityGrid.innerHTML = `
-      ${statBox('Valuation read', pe.deltaPct == null ? 'N/A' : (pe.deltaPct < 0 ? 'Trading below sector PE' : 'Trading above sector PE'))}
-      ${statBox('Price vs VWAP', vwap.deltaPct == null ? 'N/A' : (vwap.deltaPct > 0 ? 'Above VWAP (strength)' : 'Below VWAP (weakness)'))}
-      ${statBox('Note', 'Add Screener.in CSV import for full Piotroski / BV-vs-industry — not available from NSE free feed')}
-    `;
+    renderRangeBar(priceInfo.lastPrice, wk52.min, wk52.max);
+
+    // 4-week momentum needs the historical endpoint, separate from quote.
+    let pctChange4w = null, volRatio = null;
+    try {
+      const { from, to } = dateRangeForDays(35);
+      const { data: histData } = await Api.historical(symbol, from, to);
+      const hist = computeFromHistorical(histData);
+      pctChange4w = hist.pctChange4w;
+      volRatio = hist.volRatio;
+    } catch { /* conviction score will just omit this part */ }
+
+    const conv = convictionScore({
+      peDeltaPct: pe.deltaPct,
+      pctChange4w,
+      vwapDeltaPct: vwap.deltaPct,
+      volRatio,
+      sectorMomentum: null, // not aggregated on this page; sector.html has it
+    });
+    renderConviction(conv);
   } catch (err) {
     statGrid.innerHTML = `<div class="error-box">Could not load quote: ${err.message}</div>`;
   }
+}
+
+function renderRangeBar(price, lo, hi) {
+  const area = document.getElementById('range-bar-area');
+  if (price == null || lo == null || hi == null || hi <= lo) {
+    area.innerHTML = '<div class="loading">52-week range unavailable.</div>';
+    return;
+  }
+  const pct = clamp(((price - lo) / (hi - lo)) * 100, 0, 100);
+  area.innerHTML = `
+    <div class="range-bar">
+      <div class="range-fill" style="width:${pct}%"></div>
+      <div class="range-marker" style="left:${pct}%"></div>
+    </div>
+    <div class="range-labels">
+      <span>${fmtNum(lo)}</span>
+      <span class="range-current">Current: ${fmtNum(price)} (${pct.toFixed(0)}% of range)</span>
+      <span>${fmtNum(hi)}</span>
+    </div>
+  `;
+}
+
+function renderConviction(conv) {
+  const center = document.getElementById('gauge-center');
+  const breakdown = document.getElementById('conviction-breakdown');
+  const ctx = document.getElementById('conviction-gauge');
+
+  const score = conv?.score ?? null;
+  const color = convictionColor(score);
+
+  if (gaugeChart) gaugeChart.destroy();
+  gaugeChart = new Chart(ctx, {
+    type: 'doughnut',
+    data: {
+      datasets: [{
+        data: [score ?? 0, 100 - (score ?? 0)],
+        backgroundColor: [color, '#1a1f2e'],
+        borderWidth: 0,
+      }],
+    },
+    options: {
+      circumference: 270,
+      rotation: -135,
+      cutout: '72%',
+      plugins: { legend: { display: false }, tooltip: { enabled: false } },
+    },
+  });
+
+  center.innerHTML = score == null
+    ? '<div class="gauge-score">N/A</div>'
+    : `<div class="gauge-score" style="color:${color}">${score}</div><div class="gauge-label">${convictionLabel(score)}</div>`;
+
+  if (!conv) {
+    breakdown.innerHTML = '<div class="loading">Not enough data to compute a score yet.</div>';
+    return;
+  }
+  const b = conv.breakdown;
+  breakdown.innerHTML = `
+    ${breakdownBar('Valuation (vs sector PE)', b.valuation)}
+    ${breakdownBar('Momentum (4-week)', b.momentum)}
+    ${breakdownBar('Price/volume strength', b.strength)}
+  `;
+}
+
+function breakdownBar(label, value) {
+  const color = convictionColor(value);
+  return `
+    <div class="breakdown-row">
+      <div class="breakdown-label">${label}</div>
+      <div class="breakdown-track"><div class="breakdown-fill" style="width:${value}%;background:${color}"></div></div>
+      <div class="breakdown-value">${value}</div>
+    </div>
+  `;
 }
 
 async function loadNews(info) {

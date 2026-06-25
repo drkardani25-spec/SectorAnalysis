@@ -100,3 +100,76 @@ function priceVsVwap(quoteResponse) {
     price != null && vwap != null && vwap !== 0 ? ((price - vwap) / vwap) * 100 : null;
   return { price, vwap, deltaPct };
 }
+
+function clamp(v, lo, hi) {
+  return Math.max(lo, Math.min(hi, v));
+}
+
+// --- Conviction Score -------------------------------------------------
+// A composite 0-100 score built only from signals NSE's free API actually
+// gives us, deliberately shaped around the user's stated investment
+// philosophy: prefer stocks in a trending sector, trading at a valuation
+// discount to their sector, showing price/volume strength (not just "cheap"
+// for no reason). This is NOT a substitute for reading financials,
+// management quality, or governance — those need a human (or a richer paid
+// data source) and are explicitly out of scope for a free-API dashboard.
+//
+// Inputs (any may be null if data wasn't loaded):
+//   peDeltaPct     : symbol PE vs sector PE, % (negative = cheaper than sector)
+//   pctChange4w    : 4-week price change, %
+//   vwapDeltaPct   : price vs VWAP, %
+//   volRatio       : latest volume / 20-day average volume
+//   sectorMomentum : the sector's own average 4-week change, % (philosophy
+//                    point #1 — "pick a trending sector" — layered in
+//                    separately by the caller when available)
+function convictionScore({ peDeltaPct, pctChange4w, vwapDeltaPct, volRatio, sectorMomentum }) {
+  const hasAny =
+    peDeltaPct != null || pctChange4w != null || vwapDeltaPct != null || volRatio != null;
+  if (!hasAny) return null;
+
+  // cheaper than sector (negative delta) -> positive score, capped at +-30pp
+  const valuationScore = peDeltaPct != null ? -clamp(peDeltaPct, -30, 30) : 0;
+
+  // positive 4-week momentum -> positive score, capped at +-30pp
+  const momentumScore = pctChange4w != null ? clamp(pctChange4w, -30, 30) : 0;
+
+  // short-term price strength (vs VWAP) + volume pickup (rotation interest)
+  let strengthScore = 0;
+  if (vwapDeltaPct != null) strengthScore += clamp(vwapDeltaPct, -10, 10) * 2;
+  if (volRatio != null) strengthScore += clamp((volRatio - 1) * 20, -20, 30);
+
+  // sector-level trend, if the caller has it loaded
+  const sectorScore = sectorMomentum != null ? clamp(sectorMomentum, -20, 20) : 0;
+
+  // Weighted blend: valuation 30%, momentum 30%, strength 25%, sector 15%.
+  const weighted =
+    valuationScore * 0.30 + momentumScore * 0.30 + strengthScore * 0.25 + sectorScore * 0.15;
+
+  const score = clamp(50 + weighted, 0, 100);
+
+  return {
+    score: Math.round(score),
+    breakdown: {
+      valuation: Math.round(clamp(50 + valuationScore, 0, 100)),
+      momentum: Math.round(clamp(50 + momentumScore, 0, 100)),
+      strength: Math.round(clamp(50 + strengthScore, 0, 100)),
+      sector: sectorMomentum != null ? Math.round(clamp(50 + sectorScore, 0, 100)) : null,
+    },
+  };
+}
+
+function convictionLabel(score) {
+  if (score == null) return 'Insufficient data';
+  if (score >= 70) return 'High conviction';
+  if (score >= 55) return 'Mild positive';
+  if (score >= 45) return 'Neutral';
+  if (score >= 30) return 'Mild caution';
+  return 'High caution';
+}
+
+function convictionColor(score) {
+  if (score == null) return 'var(--text-dim)';
+  if (score >= 70) return 'var(--green)';
+  if (score >= 45) return 'var(--amber)';
+  return 'var(--red)';
+}
