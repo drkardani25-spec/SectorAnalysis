@@ -1,0 +1,35 @@
+name: Refresh sector/stock data
+
+on:
+  schedule:
+    # 12:30 UTC = 18:00 IST (IST has no DST, fixed +5:30 offset)
+    - cron: "30 12 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Fetch latest NSE data
+        run: node scripts/fetch-data.js
+
+      - name: Commit and push if data changed
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if git diff --quiet -- public/data; then
+            echo "No data changes, skipping commit."
+            exit 0
+          fi
+          git add public/data
+          git commit -m "Auto-refresh sector/stock data ($(date -u +%Y-%m-%dT%H:%M:%SZ))"
+          git push

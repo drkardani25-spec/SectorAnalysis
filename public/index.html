@@ -14,20 +14,21 @@
 
 <main>
   <div class="badge-note" id="data-note">
-    Metrics load on demand per sector (click "Load metrics") to stay within NSE's
-    rate limits. Live data may occasionally be unavailable — NSE blocks some
-    requests from cloud-hosted servers; cached/last-known values are shown when that happens.
+    Sector and stock metrics are precomputed once a day (18:00 IST) by a
+    scheduled job and committed straight into this site's data — the page
+    itself never calls NSE directly, since NSE blocks a lot of cloud traffic.
+    <span id="data-asof"></span>
   </div>
 
   <div class="toolbar">
     <label>Sort sectors by
       <select id="sort-select">
         <option value="name">Name (A-Z)</option>
-        <option value="momentum">4-week momentum (loaded sectors first)</option>
+        <option value="momentum">4-week momentum</option>
         <option value="count">Number of stocks</option>
       </select>
     </label>
-    <button class="btn primary" id="load-all-btn">Load metrics for all sectors</button>
+    <button class="btn primary" id="refresh-btn">Refresh data</button>
   </div>
 
   <div class="chart-row">
@@ -36,7 +37,7 @@
       <div class="chart-wrap chart-wrap-pie"><canvas id="composition-chart"></canvas></div>
     </div>
     <div class="chart-card chart-card-wide">
-      <div class="chart-title">Sector momentum ranking <span class="chart-sub">(loaded sectors, avg 4-wk change)</span></div>
+      <div class="chart-title">Sector momentum ranking <span class="chart-sub">(avg 4-wk change)</span></div>
       <div class="chart-wrap chart-wrap-bar"><canvas id="momentum-chart"></canvas></div>
     </div>
   </div>
@@ -48,9 +49,9 @@
 <script src="/js/api.js"></script>
 <script src="/js/metrics.js"></script>
 <script>
-let sectorsMap = {};   // sector -> [symbols]
-let stocksMap = {};    // symbol -> {name, sector, isin, yahooSymbol}
-const loadedMetrics = {}; // sector -> {avgChange, avgVolRatio, sampleSize}
+let sectorsMap = {};      // sector -> [symbols]
+let stocksMap = {};       // symbol -> {name, sector, isin, yahooSymbol}
+let sectorMetrics = {};   // sector -> {avgChange, avgVolRatio, sampleSize, totalStocks}
 let compositionChart = null;
 let momentumChart = null;
 
@@ -68,6 +69,25 @@ async function init() {
   ]);
   sectorsMap = sectorsRes;
   stocksMap = stocksRes;
+  await loadMetrics();
+}
+
+async function loadMetrics(bust) {
+  const suffix = bust ? `?t=${Date.now()}` : '';
+  try {
+    const [metricsRes, metaRes] = await Promise.all([
+      fetch(`/data/sector-metrics.json${suffix}`).then(r => r.json()),
+      fetch(`/data/meta.json${suffix}`).then(r => r.json()).catch(() => null),
+    ]);
+    sectorMetrics = metricsRes;
+    if (metaRes?.generatedAt) {
+      const d = new Date(metaRes.generatedAt);
+      document.getElementById('data-asof').textContent =
+        ` Data as of ${d.toLocaleString()} (${metaRes.success}/${metaRes.totalStocks} stocks loaded).`;
+    }
+  } catch (err) {
+    document.getElementById('data-asof').textContent = ' Could not load precomputed metrics yet.';
+  }
   renderGrid();
   renderCompositionChart();
   renderMomentumChart();
@@ -76,6 +96,7 @@ async function init() {
 function renderCompositionChart() {
   const ctx = document.getElementById('composition-chart');
   const sectors = Object.keys(sectorsMap).sort((a, b) => sectorsMap[b].length - sectorsMap[a].length);
+  if (compositionChart) compositionChart.destroy();
   compositionChart = new Chart(ctx, {
     type: 'doughnut',
     data: {
@@ -99,10 +120,10 @@ function renderCompositionChart() {
 
 function renderMomentumChart() {
   const ctx = document.getElementById('momentum-chart');
-  const sectors = Object.keys(loadedMetrics).filter(s => loadedMetrics[s] && !loadedMetrics[s].error);
-  const sorted = sectors.slice().sort((a, b) => (loadedMetrics[b].avgChange ?? -999) - (loadedMetrics[a].avgChange ?? -999));
+  const sectors = Object.keys(sectorMetrics).filter(s => sectorMetrics[s] && sectorMetrics[s].avgChange != null);
+  const sorted = sectors.slice().sort((a, b) => sectorMetrics[b].avgChange - sectorMetrics[a].avgChange);
 
-  const data = sorted.map(s => loadedMetrics[s].avgChange ?? 0);
+  const data = sorted.map(s => sectorMetrics[s].avgChange);
   const colors = data.map(v => v >= 0 ? 'rgba(46,204,113,0.75)' : 'rgba(231,76,60,0.75)');
 
   if (momentumChart) momentumChart.destroy();
@@ -122,14 +143,16 @@ function renderMomentumChart() {
     },
   });
 
+  const empty = ctx.parentElement.querySelector('.chart-empty');
   if (sorted.length === 0) {
-    ctx.parentElement.querySelector('.chart-empty')?.remove();
-    const empty = document.createElement('div');
-    empty.className = 'chart-empty';
-    empty.textContent = 'Load metrics for at least one sector to populate this chart.';
-    ctx.parentElement.appendChild(empty);
-  } else {
-    ctx.parentElement.querySelector('.chart-empty')?.remove();
+    if (!empty) {
+      const div = document.createElement('div');
+      div.className = 'chart-empty';
+      div.textContent = 'No precomputed metrics yet — they show up after the first data refresh runs.';
+      ctx.parentElement.appendChild(div);
+    }
+  } else if (empty) {
+    empty.remove();
   }
 }
 
@@ -142,8 +165,8 @@ function renderGrid() {
   else if (sortBy === 'count') sectors.sort((a, b) => sectorsMap[b].length - sectorsMap[a].length);
   else if (sortBy === 'momentum') {
     sectors.sort((a, b) => {
-      const ma = loadedMetrics[a]?.avgChange;
-      const mb = loadedMetrics[b]?.avgChange;
+      const ma = sectorMetrics[a]?.avgChange;
+      const mb = sectorMetrics[b]?.avgChange;
       if (ma == null && mb == null) return 0;
       if (ma == null) return 1;
       if (mb == null) return -1;
@@ -152,31 +175,22 @@ function renderGrid() {
   }
 
   grid.innerHTML = sectors.map(sectorCardHtml).join('');
-
-  sectors.forEach(s => {
-    const btn = document.getElementById(`load-${cssKey(s)}`);
-    if (btn) btn.addEventListener('click', () => loadSectorMetrics(s));
-  });
 }
-
-function cssKey(s) { return s.replace(/[^a-z0-9]/gi, '_'); }
 
 function sectorCardHtml(sector) {
   const symbols = sectorsMap[sector];
-  const m = loadedMetrics[sector];
+  const m = sectorMetrics[sector];
   const slug = encodeURIComponent(sector);
 
   let metricsHtml;
-  if (!m) {
-    metricsHtml = `<button class="btn" id="load-${cssKey(sector)}">Load metrics</button>`;
-  } else if (m.error) {
-    metricsHtml = `<div class="error-box">${m.error}</div>`;
+  if (!m || m.sampleSize === 0) {
+    metricsHtml = `<div class="loading">No data yet for this sector.</div>`;
   } else {
     const pill = pctPill(m.avgChange);
     metricsHtml = `
-      <div class="metric-row"><span class="label">Avg 4-wk change (sample)</span><span>${pill}</span></div>
+      <div class="metric-row"><span class="label">Avg 4-wk change</span><span>${pill}</span></div>
       <div class="metric-row"><span class="label">Avg volume vs 20d avg</span><span>${fmtRatio(m.avgVolRatio)}</span></div>
-      <div class="metric-row"><span class="label">Sampled / total</span><span>${m.sampleSize}/${symbols.length}</span></div>
+      <div class="metric-row"><span class="label">Loaded / total</span><span>${m.sampleSize}/${m.totalStocks}</span></div>
     `;
   }
 
@@ -201,54 +215,14 @@ function fmtRatio(val) {
   return `${val.toFixed(2)}x`;
 }
 
-// Samples up to N stocks per sector (largest-listed-first, since NSE's own
-// Nifty500 list is roughly cap-ordered) to keep request volume sane and
-// reduce the chance of NSE's anti-bot rate limiting kicking in.
-const SAMPLE_SIZE = 8;
-
-async function loadSectorMetrics(sector) {
-  const grid = document.getElementById('sector-grid');
-  loadedMetrics[sector] = null; // mark in-flight by clearing then re-render with spinner text
-  renderLoadingCard(sector);
-
-  const symbols = sectorsMap[sector].slice(0, SAMPLE_SIZE);
-  const { from, to } = dateRangeForDays(35);
-
-  let changes = [], volRatios = [], errors = 0;
-  for (const symbol of symbols) {
-    try {
-      const { data } = await Api.historical(symbol, from, to);
-      const m = computeFromHistorical(data);
-      if (m.pctChange4w != null) changes.push(m.pctChange4w);
-      if (m.volRatio != null) volRatios.push(m.volRatio);
-    } catch {
-      errors++;
-    }
-  }
-
-  if (changes.length === 0 && volRatios.length === 0) {
-    loadedMetrics[sector] = { error: 'NSE data unavailable right now for this sector — try again shortly.' };
-  } else {
-    loadedMetrics[sector] = {
-      avgChange: changes.length ? changes.reduce((a, b) => a + b, 0) / changes.length : null,
-      avgVolRatio: volRatios.length ? volRatios.reduce((a, b) => a + b, 0) / volRatios.length : null,
-      sampleSize: symbols.length - errors,
-    };
-  }
-  renderGrid();
-  renderMomentumChart();
-}
-
-function renderLoadingCard(sector) {
-  const el = document.querySelector(`[id="load-${cssKey(sector)}"]`);
-  if (el) el.outerHTML = '<div class="loading">Loading live data…</div>';
-}
-
 document.getElementById('sort-select').addEventListener('change', renderGrid);
-document.getElementById('load-all-btn').addEventListener('click', async () => {
-  for (const sector of Object.keys(sectorsMap)) {
-    if (!loadedMetrics[sector]) await loadSectorMetrics(sector);
-  }
+document.getElementById('refresh-btn').addEventListener('click', async () => {
+  const btn = document.getElementById('refresh-btn');
+  btn.disabled = true;
+  btn.textContent = 'Refreshing…';
+  await loadMetrics(true);
+  btn.disabled = false;
+  btn.textContent = 'Refresh data';
 });
 
 init();

@@ -16,10 +16,9 @@
   <div class="breadcrumb"><a href="/">&larr; All sectors</a></div>
 
   <div class="badge-note">
-    PE vs Sector PE comes straight from NSE's own classification, so it's reliable
-    when NSE responds. Click "Load valuation &amp; momentum" per stock or use
-    "Load all" — each stock costs one NSE call, so loading all is slower and more
-    likely to hit rate limits.
+    PE vs Sector PE, momentum and volume figures come from the daily
+    precomputed dataset (refreshed at 18:00 IST), not a live NSE call —
+    so this page loads instantly. <span id="data-asof"></span>
   </div>
 
   <div class="toolbar">
@@ -40,12 +39,12 @@
         <option value="conviction">Conviction score</option>
       </select>
     </label>
-    <button class="btn primary" id="load-all-btn">Load all (live)</button>
+    <button class="btn primary" id="refresh-btn">Refresh data</button>
   </div>
 
   <div class="chart-row">
     <div class="chart-card chart-card-wide">
-      <div class="chart-title">4-week momentum by stock <span class="chart-sub">(loaded stocks)</span></div>
+      <div class="chart-title">4-week momentum by stock</div>
       <div class="chart-wrap chart-wrap-bar"><canvas id="momentum-chart"></canvas></div>
     </div>
     <div class="chart-card chart-card-wide">
@@ -83,28 +82,36 @@ document.getElementById('sector-title').textContent = sector;
 
 let stocksMap = {};
 let symbols = [];
-const rowData = {}; // symbol -> {quote metrics, hist metrics, error}
+let rowData = {}; // symbol -> precomputed metrics (or {error})
 let momentumChart = null;
 let scatterChart = null;
 
-// Sector-level momentum (philosophy point #1: "pick a trending sector"),
-// approximated as the average 4-week change across whatever stocks in this
-// sector have been loaded so far. Recomputes live as more rows load.
-function sectorMomentumAvg() {
-  const changes = Object.values(rowData)
-    .map(d => d?.pctChange4w)
-    .filter(v => v != null);
-  if (!changes.length) return null;
-  return changes.reduce((a, b) => a + b, 0) / changes.length;
-}
-
 async function init() {
-  const [sectorsRes, stocksRes] = await Promise.all([
-    fetch('/data/sectors.json').then(r => r.json()),
+  const [stocksRes, sectorsRes] = await Promise.all([
     fetch('/data/stocks.json').then(r => r.json()),
+    fetch('/data/sectors.json').then(r => r.json()),
   ]);
   stocksMap = stocksRes;
   symbols = sectorsRes[sector] || [];
+  await loadMetrics();
+}
+
+async function loadMetrics(bust) {
+  const suffix = bust ? `?t=${Date.now()}` : '';
+  try {
+    const [allMetrics, metaRes] = await Promise.all([
+      fetch(`/data/stock-metrics.json${suffix}`).then(r => r.json()),
+      fetch(`/data/meta.json${suffix}`).then(r => r.json()).catch(() => null),
+    ]);
+    rowData = {};
+    symbols.forEach(s => { if (allMetrics[s]) rowData[s] = allMetrics[s]; });
+    if (metaRes?.generatedAt) {
+      const d = new Date(metaRes.generatedAt);
+      document.getElementById('data-asof').textContent = ` Data as of ${d.toLocaleString()}.`;
+    }
+  } catch (err) {
+    document.getElementById('data-asof').textContent = ' Could not load precomputed metrics yet.';
+  }
   render();
   renderCharts();
 }
@@ -157,7 +164,7 @@ function renderCharts() {
     if (noData) {
       const empty = document.createElement('div');
       empty.className = 'chart-empty';
-      empty.textContent = 'Load at least one stock to populate this chart.';
+      empty.textContent = 'No precomputed metrics yet for this sector.';
       ctx.parentElement.appendChild(empty);
     }
   });
@@ -183,8 +190,6 @@ function render() {
   tbody.innerHTML = list.map(rowHtml).join('');
 
   list.forEach(s => {
-    const btn = document.getElementById(`load-row-${s}`);
-    if (btn) btn.addEventListener('click', (e) => { e.stopPropagation(); loadRow(s); });
     const tr = document.getElementById(`tr-${s}`);
     if (tr) tr.addEventListener('click', () => { location.href = `/stock.html?symbol=${s}`; });
   });
@@ -197,12 +202,13 @@ function peDelta(symbol) {
 function convictionFor(symbol) {
   const d = rowData[symbol];
   if (!d || d.error) return null;
+  if (d.conviction) return d.conviction;
   return convictionScore({
     peDeltaPct: d.deltaPct,
     pctChange4w: d.pctChange4w,
     vwapDeltaPct: d.vwapDeltaPct,
     volRatio: d.volRatio,
-    sectorMomentum: sectorMomentumAvg(),
+    sectorMomentum: null,
   });
 }
 
@@ -210,16 +216,10 @@ function rowHtml(symbol) {
   const info = stocksMap[symbol] || { name: symbol };
   const d = rowData[symbol];
 
-  if (!d) {
+  if (!d || d.error) {
     return `<tr id="tr-${symbol}" class="row">
       <td>${symbol}</td><td>${info.name}</td>
-      <td colspan="7"><button class="btn" id="load-row-${symbol}">Load</button></td>
-    </tr>`;
-  }
-  if (d.error) {
-    return `<tr id="tr-${symbol}" class="row">
-      <td>${symbol}</td><td>${info.name}</td>
-      <td colspan="7" style="color:var(--text-dim)">data unavailable</td>
+      <td colspan="7" style="color:var(--text-dim)">data unavailable${d?.stale ? ' (showing last known values elsewhere)' : ''}</td>
     </tr>`;
   }
   const conv = convictionFor(symbol);
@@ -252,43 +252,15 @@ function pctPill(val) {
   return `<span class="pill ${cls}">${sign}${val.toFixed(1)}%</span>`;
 }
 
-async function loadRow(symbol) {
-  const cell = document.getElementById(`load-row-${symbol}`);
-  if (cell) cell.textContent = 'Loading…';
-
-  try {
-    const [{ data: quoteData }, { from, to }] = [await Api.quote(symbol), dateRangeForDays(35)];
-    const pe = peVsIndustry(quoteData);
-    const vwap = priceVsVwap(quoteData);
-
-    let histMetrics = { pctChange4w: null, volRatio: null };
-    try {
-      const { data: histData } = await Api.historical(symbol, from, to);
-      histMetrics = computeFromHistorical(histData);
-    } catch { /* leave nulls, quote data still useful */ }
-
-    rowData[symbol] = {
-      price: vwap.price,
-      symbolPe: pe.symbolPe,
-      sectorPe: pe.sectorPe,
-      deltaPct: pe.deltaPct,
-      vwapDeltaPct: vwap.deltaPct,
-      pctChange4w: histMetrics.pctChange4w,
-      volRatio: histMetrics.volRatio,
-    };
-  } catch (err) {
-    rowData[symbol] = { error: err.message };
-  }
-  render();
-  renderCharts();
-}
-
 document.getElementById('filter-select').addEventListener('change', render);
 document.getElementById('sort-select').addEventListener('change', render);
-document.getElementById('load-all-btn').addEventListener('click', async () => {
-  for (const s of symbols) {
-    if (!rowData[s]) await loadRow(s);
-  }
+document.getElementById('refresh-btn').addEventListener('click', async () => {
+  const btn = document.getElementById('refresh-btn');
+  btn.disabled = true;
+  btn.textContent = 'Refreshing…';
+  await loadMetrics(true);
+  btn.disabled = false;
+  btn.textContent = 'Refresh data';
 });
 
 init();

@@ -173,3 +173,21 @@ function convictionColor(score) {
   if (score >= 45) return 'var(--amber)';
   return 'var(--red)';
 }
+
+// Shared with scripts/fetch-data.js (Node) so the screening math lives in one
+// place. `module` is undefined in the browser, so this is a no-op there.
+if (typeof module !== 'undefined' && module.exports) {
+  module.exports = {
+    pad,
+    toNseDate,
+    dateRangeForDays,
+    normalizeRow,
+    computeFromHistorical,
+    peVsIndustry,
+    priceVsVwap,
+    clamp,
+    convictionScore,
+    convictionLabel,
+    convictionColor,
+  };
+}
